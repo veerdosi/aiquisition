@@ -1,0 +1,4 @@
+scrape_configs:
+  - job_name: "acquisition-platform"
+    static_configs:
+      - targets: ["api:8000"]
