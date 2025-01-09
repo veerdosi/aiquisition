@@ -1,18 +1,23 @@
-import requests
+import aiohttp
 import logging
 from typing import Dict, Any
 from datetime import datetime
+from bs4 import BeautifulSoup
+from pytrends.request import TrendReq
+from fake_useragent import UserAgent
+import asyncio
+import json
+import re
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 class MarketingEstimator:
     def __init__(self):
-        self.api_keys = {
-            'semrush': 'YOUR_SEMRUSH_API_KEY',
-            'similarweb': 'YOUR_SIMILARWEB_API_KEY'
-        }
+        self.ua = UserAgent()
+        self.pytrends = TrendReq()
         
-    def collect_metrics(self, domain: str) -> Dict[str, Any]:
+    async def collect_metrics(self, domain: str) -> Dict[str, Any]:
         try:
             metrics = {
                 'estimated_spend': 0.0,
@@ -21,230 +26,186 @@ class MarketingEstimator:
                 'raw_data': {}
             }
             
-            # Collect data from multiple sources
-            semrush_data = self._collect_semrush(domain)
-            similarweb_data = self._collect_similarweb(domain)
+            # Collect data from multiple free sources
+            tranco_data = await self._collect_tranco(domain)
+            trends_data = await self._collect_trends(domain)
+            tech_data = await self._collect_tech_stack(domain)
             
-            if semrush_data:
-                metrics['raw_data']['semrush'] = semrush_data
-                metrics['estimated_spend'] += semrush_data['estimated_spend']
-                metrics['channels'].update(semrush_data['channels'])
+            if tranco_data:
+                metrics['raw_data']['tranco'] = tranco_data
+                # Estimate traffic based on Tranco rank
+                metrics['estimated_spend'] = self._estimate_spend_from_rank(tranco_data['rank'])
             
-            if similarweb_data:
-                metrics['raw_data']['similarweb'] = similarweb_data
-                metrics['estimated_spend'] = (metrics['estimated_spend'] + 
-                                           similarweb_data['estimated_spend']) / 2
+            if trends_data:
+                metrics['raw_data']['trends'] = trends_data
+                metrics['channels'].update(self._process_trends_data(trends_data))
+            
+            if tech_data:
+                metrics['raw_data']['tech_stack'] = tech_data
                 
             # Calculate efficiency score
-            metrics['efficiency_score'] = self._calculate_efficiency(metrics)
+            metrics['efficiency_score'] = await self._calculate_efficiency(metrics)
             
             return metrics
             
         except Exception as e:
             logger.error(f"Error collecting marketing metrics: {str(e)}")
             return None
-            
-    def _collect_semrush(self, domain: str) -> Dict[str, Any]:
-        """
-        Collects marketing data from SEMrush API
-        """
+
+    async def _collect_tranco(self, domain: str) -> Dict[str, Any]:
+        """Collect domain ranking from Tranco list API"""
         try:
-            # SEMrush API endpoint
-            base_url = "https://api.semrush.com"
-            
-            # API parameters for domain analytics
-            params = {
-                'key': self.api_keys['semrush'],
-                'type': 'domain_ranks',
-                'domain': domain,
-                'database': 'us',  # US database
-                'export_columns': 'Dn,Rk,Or,Ot,Oc,Ad,At,Ac'
-            }
-            
-            response = requests.get(f"{base_url}/analytics/ta/overview/{domain}", params=params)
-            response.raise_for_status()
-            
-            # Get traffic data
-            traffic_data = response.json()
-            
-            # Get keyword data
-            keyword_params = {
-                'key': self.api_keys['semrush'],
-                'type': 'domain_organic',
-                'domain': domain,
-                'database': 'us',
-                'display_limit': 100
-            }
-            
-            keyword_response = requests.get(f"{base_url}/analytics/ta/keyword_organic/{domain}", 
-                                        params=keyword_params)
-            keyword_response.raise_for_status()
-            keyword_data = keyword_response.json()
-            
-            # Calculate estimated spend based on traffic and CPC
-            organic_traffic = traffic_data.get('data', {}).get('Or', 0)
-            paid_traffic = traffic_data.get('data', {}).get('Ad', 0)
-            avg_cpc = sum(kw.get('Cp', 0) for kw in keyword_data.get('data', [])) / len(keyword_data.get('data', [1]))
-            
-            estimated_monthly_spend = (paid_traffic * avg_cpc) + (organic_traffic * 0.1 * avg_cpc)  # Organic traffic valued at 10% of paid
-            
-            return {
-                'estimated_spend': estimated_monthly_spend,
-                'channels': {
-                    'organic': {
-                        'traffic': organic_traffic,
-                        'keywords': len(keyword_data.get('data', [])),
-                        'estimated_value': organic_traffic * 0.1 * avg_cpc
-                    },
-                    'paid': {
-                        'traffic': paid_traffic,
-                        'estimated_spend': paid_traffic * avg_cpc
-                    }
-                },
-                'raw_data': {
-                    'traffic_data': traffic_data,
-                    'keyword_data': keyword_data
-                }
-            }
-            
+            async with aiohttp.ClientSession() as session:
+                url = f"https://tranco-list.eu/api/ranks/domain/{domain}"
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {
+                            'rank': data.get('rank'),
+                            'last_updated': datetime.now().isoformat()
+                        }
         except Exception as e:
-            logger.error(f"Error collecting SEMrush data for {domain}: {str(e)}")
+            logger.error(f"Error collecting Tranco data for {domain}: {str(e)}")
             return None
 
-    def _collect_similarweb(self, domain: str) -> Dict[str, Any]:
-        """
-        Collects marketing data from SimilarWeb API
-        """
+    async def _collect_trends(self, domain: str) -> Dict[str, Any]:
+        """Collect Google Trends data"""
         try:
-            # SimilarWeb API endpoint
-            base_url = "https://api.similarweb.com/v1"
-            headers = {
-                'Authorization': f"Bearer {self.api_keys['similarweb']}"
-            }
+            # Remove TLD for better trend matching
+            company_name = domain.split('.')[0]
+            self.pytrends.build_payload([company_name], timeframe='today 3-m')
             
-            # Get total visits
-            visits_response = requests.get(
-                f"{base_url}/website/{domain}/total-traffic-and-engagement/visits",
-                headers=headers
-            )
-            visits_response.raise_for_status()
-            visits_data = visits_response.json()
-            
-            # Get traffic sources
-            sources_response = requests.get(
-                f"{base_url}/website/{domain}/traffic-sources/overview",
-                headers=headers
-            )
-            sources_response.raise_for_status()
-            sources_data = sources_response.json()
-            
-            # Get marketing channels
-            channels_response = requests.get(
-                f"{base_url}/website/{domain}/traffic-sources/marketing-channels",
-                headers=headers
-            )
-            channels_response.raise_for_status()
-            channels_data = channels_response.json()
-            
-            # Calculate estimated spend based on traffic sources and industry averages
-            monthly_visits = visits_data.get('visits', [])[-1] if visits_data.get('visits') else 0
-            
-            # Industry average CPCs
-            channel_cpcs = {
-                'Display': 0.58,
-                'Search': 2.69,
-                'Social': 1.23,
-                'Email': 0.45,
-                'Direct': 0.0  # No direct cost
-            }
-            
-            # Calculate spend per channel
-            channel_spend = {}
-            total_spend = 0
-            
-            for channel, data in channels_data.get('marketing_channels', {}).items():
-                traffic_share = data.get('share', 0) / 100
-                channel_traffic = monthly_visits * traffic_share
-                cpc = channel_cpcs.get(channel, 1.0)
-                channel_cost = channel_traffic * cpc
-                
-                channel_spend[channel] = {
-                    'traffic': channel_traffic,
-                    'share': traffic_share,
-                    'estimated_spend': channel_cost
-                }
-                
-                total_spend += channel_cost
+            interest_data = self.pytrends.interest_over_time()
+            related_queries = self.pytrends.related_queries()
             
             return {
-                'estimated_spend': total_spend,
-                'channels': channel_spend,
-                'raw_data': {
-                    'visits': visits_data,
-                    'sources': sources_data,
-                    'channels': channels_data
+                'interest_over_time': interest_data[company_name].tolist() if not interest_data.empty else [],
+                'related_queries': {
+                    'rising': related_queries[company_name]['rising'].to_dict('records') if related_queries[company_name]['rising'] is not None else [],
+                    'top': related_queries[company_name]['top'].to_dict('records') if related_queries[company_name]['top'] is not None else []
                 }
             }
-            
         except Exception as e:
-            logger.error(f"Error collecting SimilarWeb data for {domain}: {str(e)}")
+            logger.error(f"Error collecting Google Trends data for {domain}: {str(e)}")
             return None
 
-    def _calculate_efficiency(self, metrics: Dict) -> float:
-        """
-        Calculates marketing efficiency score based on collected metrics
-        Score ranges from 0 to 100, higher is better
-        """
+    async def _collect_tech_stack(self, domain: str) -> Dict[str, Any]:
+        """Collect technology stack information"""
         try:
-            total_spend = metrics.get('estimated_spend', 0)
-            if total_spend == 0:
-                return 0
-                
+            headers = {'User-Agent': self.ua.random}
+            async with aiohttp.ClientSession() as session:
+                url = f"https://{domain}"
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        soup = BeautifulSoup(html, 'html.parser')
+                        
+                        tech_stack = {
+                            'analytics': [],
+                            'advertising': [],
+                            'marketing_tools': []
+                        }
+                        
+                        # Detect Analytics
+                        if 'ga.js' in html or 'analytics.js' in html or 'gtag' in html:
+                            tech_stack['analytics'].append('Google Analytics')
+                        
+                        # Detect Advertising
+                        if 'googlesyndication' in html:
+                            tech_stack['advertising'].append('Google AdSense')
+                        if 'doubleclick' in html:
+                            tech_stack['advertising'].append('Google Ads')
+                            
+                        # Detect Marketing Tools
+                        if 'hubspot' in html:
+                            tech_stack['marketing_tools'].append('HubSpot')
+                        if 'marketo' in html:
+                            tech_stack['marketing_tools'].append('Marketo')
+                            
+                        return tech_stack
+        except Exception as e:
+            logger.error(f"Error collecting tech stack for {domain}: {str(e)}")
+            return None
+
+    def _estimate_spend_from_rank(self, rank: int) -> float:
+        """Estimate marketing spend based on Tranco rank"""
+        if not rank:
+            return 0.0
+            
+        # Rough estimation using power law distribution
+        base_spend = 1000000  # Assumed monthly spend for rank 1
+        decay_factor = 0.7
+        
+        estimated_spend = base_spend * (rank ** -decay_factor)
+        return round(estimated_spend, 2)
+
+    def _process_trends_data(self, trends_data: Dict) -> Dict[str, Any]:
+        """Process Google Trends data into channel metrics"""
+        channels = {
+            'search': {'score': 0, 'trend': 0},
+            'brand': {'score': 0, 'trend': 0}
+        }
+        
+        if not trends_data:
+            return channels
+            
+        # Calculate search interest
+        interest_values = trends_data.get('interest_over_time', [])
+        if interest_values:
+            recent_interest = sum(interest_values[-4:]) / 4  # Last 4 weeks average
+            channels['search']['score'] = recent_interest
+            
+            # Calculate trend (comparing with previous period)
+            previous_interest = sum(interest_values[-8:-4]) / 4
+            trend = ((recent_interest - previous_interest) / previous_interest * 100 
+                    if previous_interest > 0 else 0)
+            channels['search']['trend'] = round(trend, 2)
+        
+        # Calculate brand strength from related queries
+        rising_queries = trends_data.get('related_queries', {}).get('rising', [])
+        if rising_queries:
+            brand_terms = sum(1 for q in rising_queries if 'brand' in q.get('query', '').lower())
+            channels['brand']['score'] = (brand_terms / len(rising_queries)) * 100
+            
+        return channels
+
+    async def _calculate_efficiency(self, metrics: Dict) -> float:
+        """Calculate marketing efficiency score using available metrics"""
+        try:
             efficiency_score = 0
             weights = {
-                'traffic_cost': 0.3,
-                'channel_diversity': 0.2,
-                'organic_ratio': 0.3,
-                'brand_presence': 0.2
+                'rank_score': 0.4,
+                'trend_score': 0.3,
+                'tech_diversity': 0.3
             }
             
-            # 1. Traffic Cost Efficiency (lower is better)
-            semrush_data = metrics.get('raw_data', {}).get('semrush', {})
-            total_traffic = (
-                semrush_data.get('organic', {}).get('traffic', 0) +
-                semrush_data.get('paid', {}).get('traffic', 0)
-            )
-            cost_per_visit = total_spend / total_traffic if total_traffic > 0 else float('inf')
-            traffic_cost_score = min(100, (1 / (cost_per_visit + 0.1)) * 1000)  # Normalize to 0-100
-            
-            # 2. Channel Diversity (higher is better)
-            channels = metrics.get('channels', {})
-            active_channels = sum(1 for channel in channels.values() if channel.get('traffic', 0) > 0)
-            channel_diversity_score = (active_channels / 5) * 100  # Assuming 5 main channels
-            
-            # 3. Organic vs Paid Ratio (higher organic is better)
-            organic_traffic = semrush_data.get('organic', {}).get('traffic', 0)
-            organic_ratio = organic_traffic / total_traffic if total_traffic > 0 else 0
-            organic_score = organic_ratio * 100
-            
-            # 4. Brand Presence Score
-            similarweb_data = metrics.get('raw_data', {}).get('similarweb', {})
-            direct_traffic_share = (
-                similarweb_data.get('channels', {})
-                .get('Direct', {})
-                .get('share', 0)
-            )
-            brand_presence_score = direct_traffic_share  # Direct traffic % as brand presence score
+            # 1. Rank Score (inverse of rank percentile)
+            rank = metrics.get('raw_data', {}).get('tranco', {}).get('rank')
+            if rank:
+                rank_score = max(0, 100 - (rank / 1000000 * 100))  # Assumes top 1M websites
+            else:
+                rank_score = 0
+                
+            # 2. Trend Score
+            trends_data = metrics.get('raw_data', {}).get('trends', {})
+            trend_score = 0
+            if trends_data and trends_data.get('interest_over_time'):
+                recent_trends = trends_data['interest_over_time'][-4:]
+                trend_score = sum(recent_trends) / len(recent_trends)
+                
+            # 3. Tech Stack Diversity
+            tech_data = metrics.get('raw_data', {}).get('tech_stack', {})
+            total_tools = sum(len(tools) for tools in tech_data.values())
+            tech_score = min(100, total_tools * 20)  # 5 tools = 100%
             
             # Calculate weighted final score
             efficiency_score = (
-                traffic_cost_score * weights['traffic_cost'] +
-                channel_diversity_score * weights['channel_diversity'] +
-                organic_score * weights['organic_ratio'] +
-                brand_presence_score * weights['brand_presence']
+                rank_score * weights['rank_score'] +
+                trend_score * weights['trend_score'] +
+                tech_score * weights['tech_diversity']
             )
             
-            return min(max(efficiency_score, 0), 100)  # Ensure score is between 0 and 100
+            return min(max(efficiency_score, 0), 100)
             
         except Exception as e:
             logger.error(f"Error calculating efficiency score: {str(e)}")
